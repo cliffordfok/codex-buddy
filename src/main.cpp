@@ -467,7 +467,7 @@ static bool     _pwrCharging = false;
 static PowerStatus _pwrStatus = PWR_BATTERY;
 static uint8_t  _pwrFullStable = 0;
 static void powerRefresh() {
-  if (millis() - _pwrLastRead < 1000) return;
+  if (_pwrLastRead != 0 && millis() - _pwrLastRead < 1000) return;
   _pwrLastRead = millis();
 
   _pwrBat_mV = M5.Power.getBatteryVoltage();
@@ -499,6 +499,34 @@ static void powerRefresh() {
     _pwrFullStable = 0;
   }
   _pwrStatus = PWR_USB;
+}
+
+static uint16_t batteryColor(const Palette& p) {
+  if (_pwrStatus == PWR_CHARGING || _pwrStatus == PWR_FULL) return GREEN;
+  if (_pwrPct <= 20) return HOT;
+  if (_pwrPct <= 50) return 0xFD20;
+  return p.text;
+}
+
+static void drawBatteryBadgeOn(lgfx::v1::LGFXBase* dst, int x, int y,
+                               const Palette& p) {
+  char pctText[5];
+  snprintf(pctText, sizeof(pctText), "%d%%", _pwrPct);
+
+  dst->setTextSize(1);
+  int textX = x + 17;
+  int badgeW = 17 + dst->textWidth(pctText);
+  dst->fillRect(x - 2, y - 2, badgeW + 4, 12, p.bg);
+
+  uint16_t color = batteryColor(p);
+  dst->drawRect(x, y + 1, 12, 7, color);
+  dst->fillRect(x + 12, y + 3, 2, 3, color);
+  int fillW = (_pwrPct * 8) / 100;
+  if (fillW > 0) dst->fillRect(x + 2, y + 3, fillW, 3, color);
+
+  dst->setTextDatum(TL_DATUM);
+  dst->setTextColor(color, p.bg);
+  dst->drawString(pctText, textX, y);
 }
 
 static void clockUpdateOrient() {
@@ -1221,6 +1249,15 @@ static void drawUsageDashboard() {
   uint8_t primaryUsed = live ? tama.codexPrimary : 0;
   uint8_t secondaryUsed = live ? tama.codexSecondary : 0;
 
+  powerRefresh();
+  static int cachedBatteryPct = -1;
+  static PowerStatus cachedBatteryStatus = PWR_BATTERY;
+  if (cachedBatteryPct != _pwrPct || cachedBatteryStatus != _pwrStatus) {
+    cachedBatteryPct = _pwrPct;
+    cachedBatteryStatus = _pwrStatus;
+    usageFullPushNeeded = true;
+  }
+
   if (!usageLiveKnown || usageLastLive != live) {
     usageLiveKnown = true;
     usageLastLive = live;
@@ -1243,10 +1280,11 @@ static void drawUsageDashboard() {
 
   if (usageFullPushNeeded) {
     spr.fillRect(0, 0, W, USAGE_PET_TOP, p.bg);
+    drawBatteryBadgeOn(&spr, 4, 7, p);
     spr.setTextSize(1);
     spr.setTextDatum(TL_DATUM);
     spr.setTextColor(p.textDim, p.bg);
-    spr.drawString("CODEX USAGE", 8, 8);
+    spr.drawString("CODEX", 50, 8);
     spr.setTextDatum(TR_DATUM);
     spr.setTextColor(live ? GREEN : HOT, p.bg);
     spr.drawString(live ? "LIVE" : "WAIT", W - 8, 8);
@@ -1265,6 +1303,8 @@ static void drawUsageDashboardLandscape() {
   uint8_t secondaryUsed = live ? tama.codexSecondary : 0;
   uint32_t primaryReset = live ? tama.codexPrimaryResetsAt : 0;
   uint32_t secondaryReset = live ? tama.codexSecondaryResetsAt : 0;
+
+  powerRefresh();
 
   if (!usageLiveKnown || usageLastLive != live) {
     usageLiveKnown = true;
@@ -1295,6 +1335,10 @@ static void drawUsageDashboardLandscape() {
   static int cachedPetW = 0;
   static int cachedPetH = 0;
   static uint32_t cachedUsageMinute = 0xFFFFFFFF;
+  static int cachedBatteryPct = -1;
+  static PowerStatus cachedBatteryStatus = PWR_BATTERY;
+  bool batteryChanged = cachedBatteryPct != _pwrPct
+                     || cachedBatteryStatus != _pwrStatus;
   uint32_t usageMinute = millis() / 60000;
   uint32_t utcNow = 0;
   if (dataUtcNow(&utcNow)) usageMinute = utcNow / 60;
@@ -1350,11 +1394,13 @@ static void drawUsageDashboardLandscape() {
     if (cachedPetW == leftW && cachedPetH == lh) {
       frameDrawn = characterRenderTo(&usagePetSpr, leftW / 2, lh / 2 + 4,
                                      58, 0, 0, leftW, lh);
-      if (repaint || canvasChanged || stateChanged || frameDrawn) {
+      if (repaint || canvasChanged || stateChanged || frameDrawn || batteryChanged) {
+        drawBatteryBadgeOn(&usagePetSpr, 4, 7, p);
         usagePetSpr.pushSprite(0, 0);
       }
     } else {
       characterRenderTo(&M5.Lcd, leftW / 2, lh / 2 + 4, 58, 0, 0, leftW, lh);
+      drawBatteryBadgeOn(&M5.Lcd, 4, 7, p);
     }
     cachedPetState = activeState;
   } else {
@@ -1362,7 +1408,11 @@ static void drawUsageDashboardLandscape() {
     M5.Lcd.fillRect(0, 0, leftW, lh, p.bg);
     buddySetPeek(true);
     buddyRenderTo(&M5.Lcd, activeState);
+    drawBatteryBadgeOn(&M5.Lcd, 4, 7, p);
   }
+
+  cachedBatteryPct = _pwrPct;
+  cachedBatteryStatus = _pwrStatus;
 
   M5.Lcd.setTextDatum(TL_DATUM);
   M5.Lcd.setRotation(0);

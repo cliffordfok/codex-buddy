@@ -21,7 +21,8 @@ usage bridge.
 ## What It Displays
 
 - GIF pet area.
-- `CODEX USAGE` header with `LIVE` or `WAIT`.
+- Top-left battery icon and percentage, color-coded for charging and low battery.
+- Codex header with `LIVE` or `WAIT` connection state.
 - 5-hour quota remaining, labeled `5h`.
 - 7-day quota remaining, labeled `7d`.
 - Reset countdowns for both windows.
