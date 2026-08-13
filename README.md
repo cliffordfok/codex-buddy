@@ -21,6 +21,7 @@ usage bridge.
 ## What It Displays
 
 - GIF pet area.
+- 18 selectable built-in ASCII species, with an installed GIF as an optional alternative.
 - Top-left battery icon and percentage, color-coded for charging and low battery.
 - Codex header with `LIVE` or `WAIT` connection state.
 - 5-hour quota remaining, labeled `5h`.

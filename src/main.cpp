@@ -1266,7 +1266,9 @@ static void drawUsageDashboard() {
 
   spr.fillRect(0, USAGE_PET_BOTTOM, W, H - USAGE_PET_BOTTOM, p.bg);
 
-  if (characterLoaded()) {
+  // Respect the persisted pet selection. A GIF can remain installed in
+  // LittleFS while the user chooses one of the built-in ASCII species.
+  if (!buddyMode && characterLoaded()) {
     characterSetPeekWindow(USAGE_PET_TOP, USAGE_PET_H);
     characterSetPeekBottomAlign(false);
     characterSetPeek(true);
@@ -1375,7 +1377,7 @@ static void drawUsageDashboardLandscape() {
     cachedUsageMinute = usageMinute;
   }
 
-  if (characterLoaded()) {
+  if (!buddyMode && characterLoaded()) {
     bool canvasChanged = false;
     if (cachedPetW != leftW || cachedPetH != lh) {
       usagePetSpr.deleteSprite();
