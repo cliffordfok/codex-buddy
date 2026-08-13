@@ -3,8 +3,8 @@
 Codex Buddy turns an M5Stack StickS3 into a desktop companion for Codex usage, live states, and animated GIF pets.
 It pairs firmware with a local Codex bridge so the device can show usage bars, reset countdowns, and live work-state animations over BLE.
 
-The StickS3 shows Codex usage over BLE: a GIF pet, a 5-hour usage bar, a 7-day
-usage bar, reset countdowns, and live state changes such as `busy`, `idle`,
+The StickS3 shows Codex quota remaining over BLE: a GIF pet, a 5-hour bar, a 7-day
+bar, reset countdowns, and live state changes such as `busy`, `idle`,
 `completed`, `attention`, `dizzy`, `heart`, and `sleep`.
 
 This project is a personal fork of Anthropic's
@@ -22,13 +22,14 @@ usage bridge.
 
 - GIF pet area.
 - `CODEX USAGE` header with `LIVE` or `WAIT`.
-- Primary usage window labeled `5h`.
-- Secondary usage window labeled `7d`.
+- 5-hour quota remaining, labeled `5h`.
+- 7-day quota remaining, labeled `7d`.
 - Reset countdowns for both windows.
-- Color-coded usage bars:
-  - `0-34%`: blue
-  - `35-69%`: green
-  - `70-100%`: orange
+- Color-coded quota-remaining bars:
+  - `0-20% left`: red
+  - `21-50% left`: orange
+  - `51-100% left`: green
+- Missing quota windows are shown as `unavailable` instead of `0%`.
 - Color-coded reset time values:
   - `5h`: green above 3h, orange above 1h, red at 1h or below
   - `7d`: green above 4d, orange above 2d, red at 2d or below
@@ -275,8 +276,8 @@ The bridge sends compact JSON over BLE:
 | --- | --- |
 | `state` | Pet state: `busy`, `idle`, `completed`, `attention`, `dizzy`, `heart`, or `sleep` |
 | `tokens` | Total token usage value read by the bridge |
-| `primary` | 5-hour usage percentage |
-| `secondary` | 7-day usage percentage |
+| `primary` | 5-hour used percentage; firmware displays `100 - primary` as percent left |
+| `secondary` | 7-day used percentage; firmware displays `100 - secondary` as percent left |
 | `primary_resets_at` | Unix timestamp for primary reset |
 | `secondary_resets_at` | Unix timestamp for secondary reset |
 | `now` | Sender timestamp |

@@ -108,6 +108,14 @@ uint32_t promptArrivedMs = 0;
 const uint32_t HOUR_SEC = 3600;
 const uint32_t DAY_SEC = 86400;
 
+static uint8_t usageLeftPercent(uint8_t usedPct) {
+  return usedPct >= 100 ? 0 : (uint8_t)(100 - usedPct);
+}
+
+static bool usageAvailable(bool live, uint32_t resetAt) {
+  return live && resetAt > 0;
+}
+
 // Face-down = Z-axis dominant and negative. Debounced so a toss doesn't count.
 static bool isFaceDown() {
   float ax, ay, az;
@@ -747,8 +755,16 @@ void drawInfo() {
     _infoHeader(p, y, "CODEX", infoPage);
     spr.setTextColor(p.textDim, p.bg);
     ln("  tokens    %lu", (unsigned long)tama.codexTokens);
-    ln("  primary   %u%%", tama.codexPrimary);
-    ln("  secondary %u%%", tama.codexSecondary);
+    if (usageAvailable(tama.connected, tama.codexPrimaryResetsAt)) {
+      ln("primary   %u%% left", usageLeftPercent(tama.codexPrimary));
+    } else {
+      ln("primary   unavailable");
+    }
+    if (usageAvailable(tama.connected, tama.codexSecondaryResetsAt)) {
+      ln("secondary %u%% left", usageLeftPercent(tama.codexSecondary));
+    } else {
+      ln("secondary unavailable");
+    }
     y += 8;
     spr.setTextColor(p.text, p.bg);
     ln("LINK");
@@ -1061,10 +1077,10 @@ void drawPet() {
   spr.printf("%u/%u", petPage + 1, PET_PAGES);
 }
 
-static uint16_t usageColor(uint8_t pct, const Palette& p) {
-  if (pct >= 70) return HOT;
-  if (pct >= 35) return GREEN;
-  return 0x04DF;
+static uint16_t usageColor(uint8_t remainingPct) {
+  if (remainingPct <= 20) return HOT;
+  if (remainingPct <= 50) return 0xFD20;
+  return GREEN;
 }
 
 static uint16_t resetColor(uint32_t resetAt, const char* windowLabel, bool live, const Palette& p) {
@@ -1088,7 +1104,7 @@ static uint16_t resetColor(uint32_t resetAt, const char* windowLabel, bool live,
 static void resetText(uint32_t resetAt, char* out, size_t len) {
   uint32_t now = 0;
   if (resetAt == 0 || !dataUtcNow(&now)) {
-    snprintf(out, len, "resets --");
+    snprintf(out, len, "reset unavailable");
     return;
   }
 
@@ -1136,29 +1152,44 @@ static void resetTimeText(uint32_t resetAt, char* out, size_t len) {
 }
 
 static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
-                             uint8_t pct, const char* windowLabel,
+                             uint8_t usedPct, const char* windowLabel,
                              uint32_t resetAt, bool live, const Palette& p) {
-  if (pct > 100) pct = 100;
-  uint16_t fill = live ? usageColor(pct, p) : p.textDim;
-  char left[8];
-  snprintf(left, sizeof(left), "%u%%", pct);
+  if (usedPct > 100) usedPct = 100;
+  bool available = usageAvailable(live, resetAt);
+  uint8_t remainingPct = usageLeftPercent(usedPct);
+  uint16_t fill = available ? usageColor(remainingPct) : p.textDim;
+
+  dst->setTextDatum(TL_DATUM);
+  if (available) {
+    char pctText[6];
+    snprintf(pctText, sizeof(pctText), "%u%%", remainingPct);
+    dst->setTextSize(2);
+    dst->setTextColor(fill, p.bg);
+    dst->drawString(pctText, x, y);
+    int pctW = dst->textWidth(pctText);
+    dst->setTextSize(1);
+    dst->setTextColor(p.textDim, p.bg);
+    dst->drawString("left", x + pctW + 3, y + 8);
+  } else {
+    dst->setTextSize(1);
+    dst->setTextColor(p.textDim, p.bg);
+    dst->drawString("unavailable", x, y + 8);
+  }
 
   dst->setTextSize(2);
-  dst->setTextDatum(TL_DATUM);
-  dst->setTextColor(live ? p.text : p.textDim, p.bg);
-  dst->drawString(left, x, y);
   dst->setTextDatum(TR_DATUM);
+  dst->setTextColor(available ? p.text : p.textDim, p.bg);
   dst->drawString(windowLabel, x + w, y);
 
   const int bx = x, by = y + 24, bw = w, bh = 13;
   dst->drawRect(bx, by, bw, bh, p.textDim);
   dst->fillRect(bx + 1, by + 1, bw - 2, bh - 2, p.bg);
-  int fw = (int)((uint32_t)(bw - 2) * pct / 100);
+  int fw = available ? (int)((uint32_t)(bw - 2) * remainingPct / 100) : 0;
   if (fw > 0) dst->fillRect(bx + 1, by + 1, fw, bh - 2, fill);
 
   dst->setTextSize(1);
   dst->setTextDatum(TL_DATUM);
-  if (live && resetAt != 0) {
+  if (available) {
     uint32_t now = 0;
     char rt[12];
     resetTimeText(resetAt, rt, sizeof(rt));
@@ -1175,7 +1206,7 @@ static void drawUsageMeterOn(lgfx::v1::LGFXBase* dst, int x, int y, int w,
     }
   } else {
     dst->setTextColor(p.textDim, p.bg);
-    dst->drawString("resets --", x, y + 44);
+    dst->drawString("reset unavailable", x, y + 44);
   }
 }
 
@@ -1187,8 +1218,8 @@ static void drawUsageMeter(int y, uint8_t pct, const char* windowLabel,
 static void drawUsageDashboard() {
   const Palette& p = characterPalette();
   bool live = tama.connected;
-  uint8_t primary = live ? tama.codexPrimary : 0;
-  uint8_t secondary = live ? tama.codexSecondary : 0;
+  uint8_t primaryUsed = live ? tama.codexPrimary : 0;
+  uint8_t secondaryUsed = live ? tama.codexSecondary : 0;
 
   if (!usageLiveKnown || usageLastLive != live) {
     usageLiveKnown = true;
@@ -1221,8 +1252,8 @@ static void drawUsageDashboard() {
     spr.drawString(live ? "LIVE" : "WAIT", W - 8, 8);
   }
 
-  drawUsageMeter(122, primary, "5h", live ? tama.codexPrimaryResetsAt : 0, live, p);
-  drawUsageMeter(184, secondary, "7d", live ? tama.codexSecondaryResetsAt : 0, live, p);
+  drawUsageMeter(122, primaryUsed, "5h", live ? tama.codexPrimaryResetsAt : 0, live, p);
+  drawUsageMeter(184, secondaryUsed, "7d", live ? tama.codexSecondaryResetsAt : 0, live, p);
 
   spr.setTextDatum(TL_DATUM);
 }
@@ -1230,8 +1261,8 @@ static void drawUsageDashboard() {
 static void drawUsageDashboardLandscape() {
   const Palette& p = characterPalette();
   bool live = tama.connected;
-  uint8_t primary = live ? tama.codexPrimary : 0;
-  uint8_t secondary = live ? tama.codexSecondary : 0;
+  uint8_t primaryUsed = live ? tama.codexPrimary : 0;
+  uint8_t secondaryUsed = live ? tama.codexSecondary : 0;
   uint32_t primaryReset = live ? tama.codexPrimaryResetsAt : 0;
   uint32_t secondaryReset = live ? tama.codexSecondaryResetsAt : 0;
 
@@ -1263,13 +1294,18 @@ static void drawUsageDashboardLandscape() {
   static uint8_t cachedPetState = 0xFF;
   static int cachedPetW = 0;
   static int cachedPetH = 0;
+  static uint32_t cachedUsageMinute = 0xFFFFFFFF;
+  uint32_t usageMinute = millis() / 60000;
+  uint32_t utcNow = 0;
+  if (dataUtcNow(&utcNow)) usageMinute = utcNow / 60;
   bool panelChanged = repaint
                    || cachedOrient != clockOrient
                    || cachedLive != live
-                   || cachedPrimary != primary
-                   || cachedSecondary != secondary
+                   || cachedPrimary != primaryUsed
+                   || cachedSecondary != secondaryUsed
                    || cachedPrimaryReset != primaryReset
-                   || cachedSecondaryReset != secondaryReset;
+                   || cachedSecondaryReset != secondaryReset
+                   || cachedUsageMinute != usageMinute;
 
   if (panelChanged) {
     M5.Lcd.fillRect(rightX - 2, 0, rightW + 4, lh, p.bg);
@@ -1281,17 +1317,18 @@ static void drawUsageDashboardLandscape() {
     M5.Lcd.setTextColor(live ? GREEN : HOT, p.bg);
     M5.Lcd.drawString(live ? "LIVE" : "WAIT", lw - 8, 7);
 
-    drawUsageMeterOn(&M5.Lcd, rightX, 27, rightW, primary, "5h",
+    drawUsageMeterOn(&M5.Lcd, rightX, 27, rightW, primaryUsed, "5h",
                      primaryReset, live, p);
-    drawUsageMeterOn(&M5.Lcd, rightX, 81, rightW, secondary, "7d",
+    drawUsageMeterOn(&M5.Lcd, rightX, 81, rightW, secondaryUsed, "7d",
                      secondaryReset, live, p);
 
     cachedLive = live;
-    cachedPrimary = primary;
-    cachedSecondary = secondary;
+    cachedPrimary = primaryUsed;
+    cachedSecondary = secondaryUsed;
     cachedPrimaryReset = primaryReset;
     cachedSecondaryReset = secondaryReset;
     cachedOrient = clockOrient;
+    cachedUsageMinute = usageMinute;
   }
 
   if (characterLoaded()) {

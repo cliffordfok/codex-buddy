@@ -97,6 +97,13 @@ static uint8_t _jsonPct(JsonVariant v, uint8_t fallback) {
   return (uint8_t)n;
 }
 
+static uint32_t _jsonResetAt(JsonVariant v, uint32_t fallback) {
+  if (v.isNull()) return fallback;
+  int64_t epoch = v.as<int64_t>();
+  if (epoch <= 0 || (uint64_t)epoch > UINT32_MAX) return 0;
+  return (uint32_t)epoch;
+}
+
 static void _applyPrompt(JsonVariant v, TamaState* out, bool clearIfNull) {
   JsonObject pr = v.as<JsonObject>();
   if (!pr.isNull()) {
@@ -132,8 +139,8 @@ static void _applyJson(const char* line, TamaState* out) {
   bool codexPacket = doc["state"].is<const char*>()
                   || doc["primary"].is<int>()
                   || doc["secondary"].is<int>()
-                  || doc["primary_resets_at"].is<uint32_t>()
-                  || doc["secondary_resets_at"].is<uint32_t>();
+                  || !doc["primary_resets_at"].isNull()
+                  || !doc["secondary_resets_at"].isNull();
 
   if (codexPacket) {
     const char* st = doc["state"];
@@ -147,8 +154,8 @@ static void _applyJson(const char* line, TamaState* out) {
     }
     out->codexPrimary = _jsonPct(doc["primary"], out->codexPrimary);
     out->codexSecondary = _jsonPct(doc["secondary"], out->codexSecondary);
-    out->codexPrimaryResetsAt = doc["primary_resets_at"] | out->codexPrimaryResetsAt;
-    out->codexSecondaryResetsAt = doc["secondary_resets_at"] | out->codexSecondaryResetsAt;
+    out->codexPrimaryResetsAt = _jsonResetAt(doc["primary_resets_at"], out->codexPrimaryResetsAt);
+    out->codexSecondaryResetsAt = _jsonResetAt(doc["secondary_resets_at"], out->codexSecondaryResetsAt);
 
     out->sessionsRunning = strcmp(out->codexState, "busy") == 0 ? 1 : 0;
     out->sessionsWaiting = strcmp(out->codexState, "attention") == 0 ? 1 : 0;
