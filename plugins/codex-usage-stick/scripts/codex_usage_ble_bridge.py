@@ -14,8 +14,11 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import select
+import secrets
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -27,22 +30,44 @@ from typing import Any
 
 try:
     from bleak import BleakClient, BleakScanner
+    from bleak.exc import BleakError
 except ImportError:  # pragma: no cover - user-facing dependency path
     BleakClient = None
     BleakScanner = None
+
+    class BleakError(Exception):
+        pass
 
 
 NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
-DEFAULT_CODEX_HOME = Path.home() / ".codex"
+DEFAULT_CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 DEFAULT_CODEX_APP_CLI = Path("/Applications/Codex.app/Contents/Resources/codex")
 STATE_DIR = Path.home() / ".codex" / "codex-usage-bridge"
 DEFAULT_HOOK_APPROVAL_SOCK = STATE_DIR / "approval.sock"
+DEFAULT_HOOK_APPROVAL_ENDPOINT = STATE_DIR / "approval_endpoint.json"
 SNAPSHOT_CACHE_PATH = STATE_DIR / "last_usage_snapshot.json"
-PRIMARY_RESET_WINDOW_SEC = 5 * 60 * 60
-SECONDARY_RESET_WINDOW_SEC = 7 * 24 * 60 * 60
+PRIMARY_WINDOW_MINUTES = 5 * 60
+SECONDARY_WINDOW_MINUTES = 7 * 24 * 60
+SNAPSHOT_CACHE_MAX_AGE_SEC = 7 * 24 * 60 * 60 + 15 * 60
+RESET_CYCLE_TOLERANCE_SEC = 60
 APP_SERVER_USAGE_SOURCE = Path("account-rateLimits-read")
+
+
+class BleRetryableError(ConnectionError):
+    def __init__(self, message: str, *, connected_for: float = 0.0) -> None:
+        super().__init__(message)
+        self.connected_for = connected_for
+
+
+class DeviceNotFoundError(BleRetryableError):
+    pass
+
+
+class UsageUnavailableError(RuntimeError):
+    pass
+
 
 INTERESTING_LINE_MARKERS = (
     "token_count",
@@ -158,17 +183,15 @@ class UsageSnapshot:
             "tokens": self.tokens,
             "primary": self.primary,
             "secondary": self.secondary,
-            "primary_resets_at": roll_reset_at(self.primary_resets_at, PRIMARY_RESET_WINDOW_SEC, now),
-            "secondary_resets_at": roll_reset_at(self.secondary_resets_at, SECONDARY_RESET_WINDOW_SEC, now),
+            "primary_resets_at": live_reset_at(self.primary_resets_at, now),
+            "secondary_resets_at": live_reset_at(self.secondary_resets_at, now),
             "now": now,
         }
 
 
-def roll_reset_at(reset_at: int, window_sec: int, now: int) -> int:
-    if reset_at <= 0 or window_sec <= 0 or reset_at > now:
-        return reset_at
-    windows_elapsed = (now - reset_at) // window_sec + 1
-    return reset_at + windows_elapsed * window_sec
+def live_reset_at(reset_at: int, now: int) -> int:
+    """Return only reset epochs that still describe the current quota cycle."""
+    return reset_at if reset_at > now else 0
 
 
 def limit_matches(limit_id: str | None, preferred_limit_id: str) -> bool:
@@ -178,15 +201,14 @@ def limit_matches(limit_id: str | None, preferred_limit_id: str) -> bool:
 
 
 def snapshot_has_rate_limit(snapshot: UsageSnapshot, preferred_limit_id: str) -> bool:
+    now = int(time.time())
     return (
         limit_matches(snapshot.limit_id, preferred_limit_id)
-        and snapshot.primary_resets_at > 0
-        and snapshot.secondary_resets_at > 0
+        and (
+            snapshot.primary_resets_at > now
+            or snapshot.secondary_resets_at > now
+        )
     )
-
-
-def snapshot_has_reset_times(snapshot: UsageSnapshot) -> bool:
-    return snapshot.primary_resets_at > 0 and snapshot.secondary_resets_at > 0
 
 
 def snapshot_event_key(snapshot: UsageSnapshot) -> float:
@@ -220,17 +242,40 @@ def merge_latest_tokens(snapshot: UsageSnapshot, latest: UsageSnapshot | None) -
     )
 
 
-def merge_latest_resets(snapshot: UsageSnapshot, latest: UsageSnapshot | None) -> UsageSnapshot:
-    if (
-        not latest
-        or not snapshot_has_reset_times(latest)
-        or snapshot_event_key(latest) < snapshot_event_key(snapshot)
-    ):
-        return snapshot
+def same_reset_cycle(left: int, right: int) -> bool:
+    return (
+        left > 0
+        and right > 0
+        and abs(left - right) <= RESET_CYCLE_TOLERANCE_SEC
+    )
+
+
+def preserve_same_cycle_high_watermark(
+    snapshot: UsageSnapshot,
+    candidates: list[UsageSnapshot],
+) -> UsageSnapshot:
+    """Prevent concurrent rollout snapshots from making usage move backwards."""
+    matching = [candidate for candidate in candidates if candidate.limit_id == snapshot.limit_id]
+    primary_cycle = [
+        candidate
+        for candidate in matching
+        if same_reset_cycle(candidate.primary_resets_at, snapshot.primary_resets_at)
+    ]
+    secondary_cycle = [
+        candidate
+        for candidate in matching
+        if same_reset_cycle(candidate.secondary_resets_at, snapshot.secondary_resets_at)
+    ]
     return replace(
         snapshot,
-        primary_resets_at=latest.primary_resets_at,
-        secondary_resets_at=latest.secondary_resets_at,
+        primary=max([snapshot.primary, *(candidate.primary for candidate in primary_cycle)]),
+        secondary=max([snapshot.secondary, *(candidate.secondary for candidate in secondary_cycle)]),
+        primary_resets_at=max(
+            [snapshot.primary_resets_at, *(candidate.primary_resets_at for candidate in primary_cycle)]
+        ),
+        secondary_resets_at=max(
+            [snapshot.secondary_resets_at, *(candidate.secondary_resets_at for candidate in secondary_cycle)]
+        ),
     )
 
 
@@ -249,13 +294,21 @@ def snapshot_to_cache(snapshot: UsageSnapshot) -> dict[str, Any]:
     }
 
 
-def snapshot_from_cache(path: Path) -> UsageSnapshot | None:
+def snapshot_from_cache(path: Path, now: float | None = None) -> UsageSnapshot | None:
     try:
         data = json.loads(path.read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
     try:
-        return UsageSnapshot(
+        now = time.time() if now is None else now
+        saved_at = float(data.get("saved_at") or 0)
+        if (
+            saved_at <= 0
+            or saved_at > now + RESET_CYCLE_TOLERANCE_SEC
+            or now - saved_at > SNAPSHOT_CACHE_MAX_AGE_SEC
+        ):
+            return None
+        snapshot = UsageSnapshot(
             tokens=int(data.get("tokens") or 0),
             primary=clamp_percent(data.get("primary")),
             secondary=clamp_percent(data.get("secondary")),
@@ -266,6 +319,9 @@ def snapshot_from_cache(path: Path) -> UsageSnapshot | None:
             limit_id=data.get("limit_id"),
             limit_name=data.get("limit_name"),
         )
+        if snapshot.primary_resets_at <= now and snapshot.secondary_resets_at <= now:
+            return None
+        return snapshot
     except (TypeError, ValueError):
         return None
 
@@ -308,15 +364,25 @@ def app_server_usage_snapshot_from_result(
     if not isinstance(primary, dict) or not isinstance(secondary, dict):
         return None
 
-    primary_resets_at = int(primary.get("resetsAt") or 0)
-    secondary_resets_at = int(secondary.get("resetsAt") or 0)
-    if primary_resets_at <= 0 or secondary_resets_at <= 0:
+    (
+        primary_used,
+        secondary_used,
+        primary_resets_at,
+        secondary_resets_at,
+    ) = map_rate_limit_windows(
+        primary,
+        secondary,
+        used_key="usedPercent",
+        reset_key="resetsAt",
+        window_key="windowMinutes",
+    )
+    if primary_resets_at <= 0 and secondary_resets_at <= 0:
         return None
 
     snapshot = UsageSnapshot(
         tokens=activity.tokens if activity else 0,
-        primary=clamp_percent(primary.get("usedPercent")),
-        secondary=clamp_percent(secondary.get("usedPercent")),
+        primary=primary_used,
+        secondary=secondary_used,
         primary_resets_at=primary_resets_at,
         secondary_resets_at=secondary_resets_at,
         source=APP_SERVER_USAGE_SOURCE,
@@ -443,6 +509,52 @@ def clamp_percent(value: Any) -> int:
     except (TypeError, ValueError):
         n = 0
     return max(0, min(100, n))
+
+
+def map_rate_limit_windows(
+    primary: dict[str, Any],
+    secondary: dict[str, Any],
+    *,
+    used_key: str,
+    reset_key: str,
+    window_key: str,
+) -> tuple[int, int, int, int]:
+    """Map upstream quota windows onto the firmware's fixed 5h and 7d rows."""
+    slots: dict[str, tuple[int, int, int]] = {
+        "primary": (0, 0, -1),
+        "secondary": (0, 0, -1),
+    }
+    for fallback_slot, window in (("primary", primary), ("secondary", secondary)):
+        if not isinstance(window, dict) or not window:
+            continue
+        try:
+            window_minutes = int(window.get(window_key) or 0)
+            reset_at = int(window.get(reset_key) or 0)
+        except (TypeError, ValueError):
+            continue
+
+        if window_minutes == PRIMARY_WINDOW_MINUTES:
+            target_slot = "primary"
+            priority = 2
+        elif window_minutes == SECONDARY_WINDOW_MINUTES:
+            target_slot = "secondary"
+            priority = 2
+        else:
+            if window_minutes > 0:
+                continue
+            target_slot = fallback_slot
+            priority = 1
+
+        used = clamp_percent(window.get(used_key))
+        current_used, current_reset, current_priority = slots[target_slot]
+        if priority > current_priority:
+            slots[target_slot] = (used, reset_at, priority)
+        elif priority == current_priority and same_reset_cycle(reset_at, current_reset):
+            slots[target_slot] = (max(used, current_used), max(reset_at, current_reset), priority)
+
+    primary_used, primary_reset, _ = slots["primary"]
+    secondary_used, secondary_reset, _ = slots["secondary"]
+    return primary_used, secondary_used, primary_reset, secondary_reset
 
 
 def parse_timestamp(value: Any) -> float | None:
@@ -578,13 +690,25 @@ def extract_token_counts(path: Path, max_bytes: int) -> list[UsageSnapshot]:
         rate_limits = payload.get("rate_limits") or {}
         primary = rate_limits.get("primary") or {}
         secondary = rate_limits.get("secondary") or {}
+        (
+            primary_used,
+            secondary_used,
+            primary_resets_at,
+            secondary_resets_at,
+        ) = map_rate_limit_windows(
+            primary,
+            secondary,
+            used_key="used_percent",
+            reset_key="resets_at",
+            window_key="window_minutes",
+        )
 
         snapshot = UsageSnapshot(
             tokens=int(total_usage.get("total_tokens") or 0),
-            primary=clamp_percent(primary.get("used_percent")),
-            secondary=clamp_percent(secondary.get("used_percent")),
-            primary_resets_at=int(primary.get("resets_at") or 0),
-            secondary_resets_at=int(secondary.get("resets_at") or 0),
+            primary=primary_used,
+            secondary=secondary_used,
+            primary_resets_at=primary_resets_at,
+            secondary_resets_at=secondary_resets_at,
             source=path,
             event_ts=event_ts,
             limit_id=rate_limits.get("limit_id"),
@@ -613,7 +737,9 @@ def choose_best_rate_limit_snapshot(
     latest_ts = max(snapshot_event_key(s) for s in valid)
     fresh = [s for s in valid if latest_ts - snapshot_event_key(s) <= preferred_fresh_window]
     exact = [s for s in fresh if s.limit_id == preferred_limit_id]
-    return max(exact or fresh, key=snapshot_event_key)
+    candidates = exact or fresh
+    latest = max(candidates, key=snapshot_event_key)
+    return preserve_same_cycle_high_watermark(latest, candidates)
 
 
 def read_usage(args: argparse.Namespace) -> UsageSnapshot:
@@ -646,21 +772,19 @@ def read_usage(args: argparse.Namespace) -> UsageSnapshot:
         cached = None
 
     if best and (not cached or snapshot_event_key(best) >= snapshot_event_key(cached)):
+        if cached:
+            best = preserve_same_cycle_high_watermark(best, [cached])
         if latest_any:
             best = attach_activity(best, latest_any)
-            best = merge_latest_resets(best, latest_any)
         setattr(read_usage, "_last_valid_snapshot", best)
         save_snapshot_cache(best)
         return merge_latest_tokens(best, latest_any)
 
     if cached:
-        cached = merge_latest_resets(cached, latest_any)
         setattr(read_usage, "_last_valid_snapshot", cached)
-        save_snapshot_cache(cached)
         return merge_latest_tokens(cached, latest_any)
 
     if best:
-        best = merge_latest_resets(best, latest_any)
         setattr(read_usage, "_last_valid_snapshot", best)
         save_snapshot_cache(best)
         return best
@@ -668,7 +792,7 @@ def read_usage(args: argparse.Namespace) -> UsageSnapshot:
     if latest_any and snapshot_has_rate_limit(latest_any, args.limit_id):
         return latest_any
 
-    raise RuntimeError(
+    raise UsageUnavailableError(
         f"No displayable {args.limit_id} quota event found in recent rollout files"
     )
 
@@ -714,9 +838,13 @@ class BleSession:
 
     async def start_notify(self) -> None:
         try:
-            await self.client.start_notify(NUS_TX_UUID, self._on_notify)
-        except Exception as exc:
+            await asyncio.wait_for(
+                self.client.start_notify(NUS_TX_UUID, self._on_notify),
+                timeout=self.args.notify_timeout,
+            )
+        except (BleakError, OSError, TimeoutError, ConnectionError) as exc:
             print(f"[ble] notifications unavailable: {exc}", file=sys.stderr)
+            raise BleRetryableError(f"notification setup failed: {exc}") from exc
 
     def _on_notify(self, _sender: Any, data: bytearray) -> None:
         self._notify_buffer += bytes(data).decode("utf-8", errors="replace")
@@ -735,11 +863,22 @@ class BleSession:
 
     async def write_json(self, packet: dict[str, Any]) -> str:
         payload = (json.dumps(packet, separators=(",", ":")) + "\n").encode("utf-8")
-        async with self._write_lock:
+
+        async def write_chunks() -> None:
             for i in range(0, len(payload), self.args.chunk_size):
                 chunk = payload[i:i + self.args.chunk_size]
-                await self.client.write_gatt_char(NUS_RX_UUID, chunk, response=not self.args.no_response)
+                await self.client.write_gatt_char(
+                    NUS_RX_UUID,
+                    chunk,
+                    response=not self.args.no_response,
+                )
                 await asyncio.sleep(self.args.chunk_delay)
+
+        async with self._write_lock:
+            try:
+                await asyncio.wait_for(write_chunks(), timeout=self.args.write_timeout)
+            except (BleakError, OSError, TimeoutError, ConnectionError) as exc:
+                raise BleRetryableError(f"GATT write failed: {exc}") from exc
         return payload.decode("utf-8").strip()
 
 
@@ -763,11 +902,67 @@ class CodexApprovalProxy:
         self.next_prompt_num = 1
         self.enabled = False
         self.ipc_server: asyncio.AbstractServer | None = None
+        self.ipc_token: str | None = None
+        self._ipc_client_tasks: set[asyncio.Task[None]] = set()
+        self._closing = False
 
     def has_pending(self) -> bool:
         return bool(self.pending)
 
     async def start_ipc_server(self) -> None:
+        self._closing = False
+        if os.name == "nt":
+            endpoint = self.args.hook_approval_endpoint
+            if not endpoint:
+                return
+            endpoint.parent.mkdir(parents=True, exist_ok=True)
+            endpoint_tmp = endpoint.with_name(f"{endpoint.name}.{os.getpid()}.tmp")
+            with contextlib.suppress(FileNotFoundError):
+                endpoint.unlink()
+            with contextlib.suppress(FileNotFoundError):
+                endpoint_tmp.unlink()
+            try:
+                self.ipc_token = secrets.token_urlsafe(32)
+                self.ipc_server = await asyncio.start_server(
+                    self._accept_ipc_client,
+                    host="127.0.0.1",
+                    port=0,
+                    family=socket.AF_INET,
+                )
+                server_sockets = self.ipc_server.sockets or []
+                if not server_sockets:
+                    raise RuntimeError("approval IPC did not bind a socket")
+                port = int(server_sockets[0].getsockname()[1])
+                endpoint_tmp.write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "host": "127.0.0.1",
+                            "port": port,
+                            "token": self.ipc_token,
+                        },
+                        separators=(",", ":"),
+                    ) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(endpoint_tmp, endpoint)
+                with contextlib.suppress(OSError):
+                    endpoint.chmod(0o600)
+                if self.args.verbose:
+                    print(f"[approval] hook IPC listening on 127.0.0.1:{port}", file=sys.stderr)
+            except Exception as exc:
+                if self.ipc_server:
+                    self.ipc_server.close()
+                    await self.ipc_server.wait_closed()
+                    self.ipc_server = None
+                self.ipc_token = None
+                with contextlib.suppress(FileNotFoundError):
+                    endpoint_tmp.unlink()
+                with contextlib.suppress(FileNotFoundError):
+                    endpoint.unlink()
+                print(f"[approval] hook IPC unavailable: {exc}", file=sys.stderr)
+            return
+
         sock = self.args.hook_approval_sock
         if not sock:
             return
@@ -776,7 +971,7 @@ class CodexApprovalProxy:
             sock.unlink()
         try:
             self.ipc_server = await asyncio.start_unix_server(
-                self._handle_ipc_client,
+                self._accept_ipc_client,
                 path=str(sock),
             )
             with contextlib.suppress(OSError):
@@ -786,26 +981,74 @@ class CodexApprovalProxy:
         except Exception as exc:
             print(f"[approval] hook IPC unavailable: {exc}", file=sys.stderr)
 
+    def _accept_ipc_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        task = asyncio.create_task(self._handle_ipc_client(reader, writer))
+        self._ipc_client_tasks.add(task)
+        task.add_done_callback(self._ipc_client_tasks.discard)
+
     async def close_ipc_server(self) -> None:
-        if self.ipc_server:
-            self.ipc_server.close()
-            await self.ipc_server.wait_closed()
-            self.ipc_server = None
-        sock = self.args.hook_approval_sock
-        if sock:
-            with contextlib.suppress(FileNotFoundError):
-                sock.unlink()
+        # A BLE reconnect invalidates every prompt shown by the old session.
+        # Stop accepting work first, then wake/cancel accepted clients so Codex
+        # can fall back to its normal UI without waiting for the full timeout.
+        self._closing = True
+        server = self.ipc_server
+        self.ipc_server = None
+        if server:
+            server.close()
+
+        if os.name == "nt":
+            endpoint = self.args.hook_approval_endpoint
+            if endpoint:
+                with contextlib.suppress(FileNotFoundError):
+                    endpoint.unlink()
+            self.ipc_token = None
+        else:
+            sock = self.args.hook_approval_sock
+            if sock:
+                with contextlib.suppress(FileNotFoundError):
+                    sock.unlink()
+
+        for request in self.pending.values():
+            future = request.get("future")
+            if isinstance(future, asyncio.Future) and not future.done():
+                future.set_result("unavailable")
+        self.pending.clear()
+        self.pending_order.clear()
+        self.active_prompt_id = None
+
+        client_tasks = list(self._ipc_client_tasks)
+        for task in client_tasks:
+            if not task.done():
+                task.cancel()
+        if client_tasks:
+            await asyncio.gather(*client_tasks, return_exceptions=True)
+        self._ipc_client_tasks.clear()
+
+        if server:
+            await server.wait_closed()
 
     async def _handle_ipc_client(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        response: dict[str, Any]
+        response: dict[str, Any] | None = None
         try:
             raw = await asyncio.wait_for(reader.readline(), timeout=2.0)
             request = json.loads(raw.decode("utf-8", errors="replace"))
-            if request.get("type") != "permission_request":
+            supplied_token = request.get("token")
+            if self._closing:
+                response = {"ok": False, "reason": "bridge reconnecting"}
+            elif self.ipc_token and (
+                not isinstance(supplied_token, str)
+                or not secrets.compare_digest(self.ipc_token, supplied_token)
+            ):
+                response = {"ok": False, "reason": "unauthorized"}
+            elif request.get("type") != "permission_request":
                 response = {"ok": False, "reason": "unsupported request"}
             else:
                 timeout = float(request.get("timeout") or self.args.hook_approval_timeout)
@@ -815,15 +1058,22 @@ class CodexApprovalProxy:
                     response = {"ok": True, "decision": decision}
                 else:
                     response = {"ok": False, "reason": "timeout"}
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             response = {"ok": False, "reason": repr(exc)}
-
-        writer.write((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8"))
-        with contextlib.suppress(Exception):
-            await writer.drain()
-        writer.close()
-        with contextlib.suppress(Exception):
-            await writer.wait_closed()
+        finally:
+            try:
+                if response is not None:
+                    with contextlib.suppress(Exception):
+                        writer.write(
+                            (json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8")
+                        )
+                        await writer.drain()
+            finally:
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
 
     async def inject_test_request(self) -> None:
         prompt_id = f"test{self.next_prompt_num}"
@@ -1179,7 +1429,7 @@ async def find_device(name_filter: str, address: str | None, timeout: float):
         if any(key in (d.name or "") for key in ("Codex", "Claude"))
     ]
     names = ", ".join(sorted(interesting)) or "none"
-    raise RuntimeError(f"Codex BLE device not found. Saw: {names}")
+    raise DeviceNotFoundError(f"Codex BLE device not found. Saw: {names}")
 
 
 async def send_packet(args: argparse.Namespace, packet: dict[str, Any]) -> None:
@@ -1229,6 +1479,119 @@ async def send_usage_update(
             )
 
 
+async def run_ble_session(args: argparse.Namespace, tracker: ActivityTracker) -> None:
+    assert BleakClient is not None
+    try:
+        dev = await find_device(args.name, args.address, args.scan_timeout)
+    except DeviceNotFoundError:
+        raise
+    except (BleakError, OSError, TimeoutError, ConnectionError) as exc:
+        raise BleRetryableError(f"BLE scan failed: {exc}") from exc
+
+    loop = asyncio.get_running_loop()
+    disconnected = asyncio.Event()
+
+    def on_disconnected(_client: BleakClient) -> None:
+        try:
+            loop.call_soon_threadsafe(disconnected.set)
+        except RuntimeError:
+            # The event loop can already be closed during interpreter shutdown.
+            pass
+
+    client = BleakClient(
+        dev,
+        disconnected_callback=on_disconnected,
+        timeout=args.connect_timeout,
+    )
+    try:
+        await asyncio.wait_for(client.connect(), timeout=args.connect_timeout)
+    except (BleakError, OSError, TimeoutError, ConnectionError) as exc:
+        with contextlib.suppress(BleakError, OSError, TimeoutError, ConnectionError):
+            await asyncio.wait_for(client.disconnect(), timeout=args.connect_timeout)
+        raise BleRetryableError(f"BLE connect failed: {exc}") from exc
+
+    connected_at = time.monotonic()
+    tasks: set[asyncio.Task[Any]] = set()
+    approvals: CodexApprovalProxy | None = None
+    try:
+        if args.pair and not getattr(args, "_pair_completed", False) and hasattr(client, "pair"):
+            try:
+                await asyncio.wait_for(client.pair(), timeout=args.connect_timeout)
+            except Exception as exc:  # macOS often pairs on encrypted write
+                print(f"[pair] continuing after pair attempt failed: {exc}", file=sys.stderr)
+            else:
+                setattr(args, "_pair_completed", True)
+
+        ble = BleSession(args, client)
+        await ble.start_notify()
+        approvals = CodexApprovalProxy(args, ble)
+
+        async def usage_runner() -> None:
+            while True:
+                try:
+                    await send_usage_update(args, tracker, ble, approvals)
+                except UsageUnavailableError as exc:
+                    if args.once:
+                        raise
+                    print(f"[usage] waiting for local quota data: {exc}", file=sys.stderr)
+                if args.once:
+                    return
+                await asyncio.sleep(args.interval)
+
+        async def device_runner() -> None:
+            while True:
+                msg = await ble.incoming.get()
+                await approvals.handle_device_message(msg)
+
+        await approvals.start_ipc_server()
+        await approvals.start()
+        if args.test_approval and not getattr(args, "_test_approval_injected", False):
+            await approvals.inject_test_request()
+            setattr(args, "_test_approval_injected", True)
+
+        if args.once:
+            await usage_runner()
+            return
+
+        usage_task = asyncio.create_task(usage_runner(), name="usage-runner")
+        device_task = asyncio.create_task(device_runner(), name="device-runner")
+        disconnect_task = asyncio.create_task(
+            disconnected.wait(),
+            name="ble-disconnect-watchdog",
+        )
+        tasks.update((usage_task, device_task, disconnect_task))
+        done, _pending = await asyncio.wait(
+            tasks,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # Preserve the concrete GATT/notification error when one exists;
+        # it is more useful than the generic disconnect callback.
+        if usage_task in done:
+            usage_task.result()
+            raise BleRetryableError("usage sender stopped unexpectedly")
+        if device_task in done:
+            device_task.result()
+            raise BleRetryableError("device notification reader stopped unexpectedly")
+        raise BleRetryableError("BLE device disconnected")
+    except BleRetryableError as exc:
+        exc.connected_for = max(exc.connected_for, time.monotonic() - connected_at)
+        raise
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if approvals:
+            await approvals.close_ipc_server()
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=args.connect_timeout)
+        except (BleakError, OSError, TimeoutError, ConnectionError) as exc:
+            if args.verbose:
+                print(f"[ble] disconnect cleanup failed: {exc}", file=sys.stderr)
+
+
 async def bridge_loop(args: argparse.Namespace) -> None:
     setattr(find_device, "debug_scan", args.debug_scan)
     tracker = ActivityTracker()
@@ -1239,42 +1602,43 @@ async def bridge_loop(args: argparse.Namespace) -> None:
                 return
             await asyncio.sleep(args.interval)
 
-    assert BleakClient is not None
-    dev = await find_device(args.name, args.address, args.scan_timeout)
-    async with BleakClient(dev, timeout=args.connect_timeout) as client:
-        if args.pair and hasattr(client, "pair"):
-            try:
-                await client.pair()
-            except Exception as exc:  # macOS often pairs on encrypted write
-                print(f"[pair] continuing after pair attempt failed: {exc}", file=sys.stderr)
+    reconnect_delay = max(0.1, float(args.reconnect_delay))
+    reconnect_max_delay = max(reconnect_delay, float(args.reconnect_max_delay))
+    reconnect_reset_after = max(0.1, float(args.reconnect_reset_after))
+    reconnect_attempts = max(1, int(args.reconnect_attempts))
+    consecutive_failures = 0
 
-        ble = BleSession(args, client)
-        await ble.start_notify()
-        approvals = CodexApprovalProxy(args, ble)
-        await approvals.start_ipc_server()
-        await approvals.start()
-        if args.test_approval:
-            await approvals.inject_test_request()
-
-        async def usage_runner() -> None:
-            while True:
-                await send_usage_update(args, tracker, ble, approvals)
-                if args.once:
-                    return
-                await asyncio.sleep(args.interval)
-
-        async def device_runner() -> None:
-            while True:
-                msg = await ble.incoming.get()
-                await approvals.handle_device_message(msg)
-
+    while True:
         try:
+            await run_ble_session(args, tracker)
+            return
+        except asyncio.CancelledError:
+            raise
+        except BleRetryableError as exc:
             if args.once:
-                await usage_runner()
-                return
-            await asyncio.gather(usage_runner(), device_runner())
-        finally:
-            await approvals.close_ipc_server()
+                raise
+
+            stable_for = exc.connected_for
+            if stable_for >= reconnect_reset_after:
+                consecutive_failures = 0
+                reconnect_delay = max(0.1, float(args.reconnect_delay))
+            consecutive_failures += 1
+            if consecutive_failures >= reconnect_attempts:
+                raise RuntimeError(
+                    f"BLE reconnect limit reached after {consecutive_failures} failures"
+                ) from exc
+
+            print(
+                f"[ble] session ended: {exc}; reconnecting in {reconnect_delay:.1f}s "
+                f"({consecutive_failures}/{reconnect_attempts})",
+                file=sys.stderr,
+                flush=True,
+            )
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(
+                reconnect_max_delay,
+                max(0.1, reconnect_delay * 2.0),
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1290,6 +1654,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-appserver-usage",
         action="store_true",
+        default=True,
         help="Disable account/rateLimits/read and use rollout logs only",
     )
     p.add_argument(
@@ -1304,6 +1669,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scan-timeout", type=float, default=8.0)
     p.add_argument("--debug-scan", action="store_true", help="Print raw BLE scan results")
     p.add_argument("--connect-timeout", type=float, default=20.0)
+    p.add_argument("--notify-timeout", type=float, default=10.0)
+    p.add_argument("--write-timeout", type=float, default=10.0)
+    p.add_argument(
+        "--reconnect-delay",
+        type=float,
+        default=5.0,
+        help="Initial delay between BLE connection attempts",
+    )
+    p.add_argument(
+        "--reconnect-max-delay",
+        type=float,
+        default=10.0,
+        help="Maximum BLE reconnect delay",
+    )
+    p.add_argument(
+        "--reconnect-reset-after",
+        type=float,
+        default=30.0,
+        help="Stable session duration that resets reconnect backoff",
+    )
+    p.add_argument(
+        "--reconnect-attempts",
+        type=int,
+        default=720,
+        help="Maximum consecutive BLE session failures before exiting",
+    )
     p.add_argument("--no-response", action="store_true", help="Use write-without-response")
     p.add_argument("--pair", action="store_true", help="Try explicit BLE pairing first")
     p.add_argument("--chunk-size", type=int, default=20, help="BLE write chunk size")
@@ -1311,6 +1702,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--no-approval-proxy",
         action="store_true",
+        default=True,
         help="Disable Codex app-server approval proxy integration",
     )
     p.add_argument(
@@ -1333,6 +1725,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_HOOK_APPROVAL_SOCK,
         help="Unix socket used by PermissionRequest hooks to ask the StickS3",
+    )
+    p.add_argument(
+        "--hook-approval-endpoint",
+        type=Path,
+        default=DEFAULT_HOOK_APPROVAL_ENDPOINT,
+        help="Windows loopback endpoint file used by PermissionRequest hooks",
     )
     p.add_argument(
         "--hook-approval-timeout",
@@ -1360,6 +1758,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    args.notify_timeout = max(0.1, float(args.notify_timeout))
+    args.write_timeout = max(0.1, float(args.write_timeout))
+    args.reconnect_delay = max(0.1, float(args.reconnect_delay))
+    args.reconnect_max_delay = max(args.reconnect_delay, float(args.reconnect_max_delay))
+    args.reconnect_reset_after = max(0.1, float(args.reconnect_reset_after))
+    args.reconnect_attempts = max(1, int(args.reconnect_attempts))
     args.codex_home = args.codex_home.expanduser()
     if args.rollout:
         args.rollout = args.rollout.expanduser()
@@ -1367,6 +1771,8 @@ def main() -> int:
         args.approval_sock = args.approval_sock.expanduser()
     if args.hook_approval_sock:
         args.hook_approval_sock = args.hook_approval_sock.expanduser()
+    if args.hook_approval_endpoint:
+        args.hook_approval_endpoint = args.hook_approval_endpoint.expanduser()
     if args.codex_cli:
         args.codex_cli = args.codex_cli.expanduser()
 

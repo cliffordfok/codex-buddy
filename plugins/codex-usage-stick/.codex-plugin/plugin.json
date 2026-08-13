@@ -5,8 +5,8 @@
   "author": {
     "name": "Hugo Makerhund"
   },
-  "homepage": "https://github.com/openelab-commits/claude-desktop-buddy-GIF",
-  "repository": "https://github.com/openelab-commits/claude-desktop-buddy-GIF",
+  "homepage": "https://github.com/openelab-commits/codex-buddy",
+  "repository": "https://github.com/openelab-commits/codex-buddy",
   "license": "MIT",
   "keywords": [
     "codex",
@@ -20,16 +20,16 @@
   "interface": {
     "displayName": "Codex Usage Stick",
     "shortDescription": "Start the StickS3 Codex usage BLE bridge",
-    "longDescription": "Starts a local Python BLE bridge when a Codex session starts. The bridge reads local Codex usage data and sends token totals, 5h usage, and 7d usage to a StickS3 running the matching firmware.",
+    "longDescription": "Starts a local Python BLE bridge when a Codex session starts. The bridge reads local Codex usage data and sends token totals plus 5h and 7d quota windows to a StickS3 running the matching firmware.",
     "developerName": "Hugo Makerhund",
     "category": "Engineering",
     "capabilities": [
       "Interactive",
       "Read"
     ],
-    "websiteURL": "https://github.com/openelab-commits/claude-desktop-buddy-GIF",
-    "privacyPolicyURL": "https://github.com/openelab-commits/claude-desktop-buddy-GIF",
-    "termsOfServiceURL": "https://github.com/openelab-commits/claude-desktop-buddy-GIF",
+    "websiteURL": "https://github.com/openelab-commits/codex-buddy",
+    "privacyPolicyURL": "https://github.com/openelab-commits/codex-buddy",
+    "termsOfServiceURL": "https://github.com/openelab-commits/codex-buddy",
     "defaultPrompt": [
       "Check my Codex Usage Stick bridge status"
     ],

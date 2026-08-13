@@ -1,6 +1,6 @@
 ---
 name: codex-usage-pet
-description: Create, validate, preview, and package Codex Usage Stick pet spritesheets with seven hardware states: busy, idle, completed, attention, dizzy, heart, and sleep. Use when the user wants a StickS3/Codex Usage pet that outputs pet.json and spritesheet.webp instead of separate GIF files.
+description: "Create, validate, preview, and package Codex Usage Stick pet spritesheets with seven hardware states: busy, idle, completed, attention, dizzy, heart, and sleep. Use when the user wants a StickS3/Codex Usage pet that outputs pet.json and spritesheet.webp instead of separate GIF files."
 ---
 
 # Codex Usage Pet

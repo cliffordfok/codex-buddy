@@ -1,6 +1,8 @@
 .pio/
 .vscode/
 .DS_Store
+__pycache__/
+*.py[cod]
 data/*
 !data/characters/
 data/characters/*

@@ -11,6 +11,23 @@ The plugin is local-first:
 - It writes diagnostics under `~/.codex/codex-usage-bridge/`.
 - It does not send data to an external server.
 
+The background process automatically rescans and reconnects after transient
+Bluetooth, GATT, Stick reboot, or Windows resume failures. BLE and approval
+IPC resources are closed before each retry, and retries use a bounded
+exponential backoff. Turning the StickS3 LCD off does not stop BLE; after the
+LCD is turned back on, the latest usage display returns without another Codex
+prompt.
+
+## Usage Values
+
+Codex rollout files report quota consumption as `used_percent`. The bridge
+maps each quota by its actual `window_minutes`: 300 minutes goes to the 5h row
+and 10,080 minutes goes to the 7d row. Matching firmware displays `100 - used`
+as percentage remaining, consistent with the Codex UI's `left` convention.
+
+Expired reset timestamps and stale cache entries are reported as unavailable;
+the bridge does not fabricate a future reset time.
+
 ## Hooks
 
 The plugin registers:
@@ -44,7 +61,7 @@ Fill the dialog like this:
 
 ```text
 Source:
-openelab-commits/codex-desktop-buddy
+openelab-commits/codex-buddy
 
 Git ref:
 main
@@ -55,21 +72,24 @@ If this lives in your own fork, use your fork's `owner/repo`.
 ## CLI Fallback
 
 ```bash
-/Applications/Codex.app/Contents/Resources/codex plugin marketplace add openelab-commits/codex-desktop-buddy --ref main
+codex plugin marketplace add openelab-commits/codex-buddy --ref main
+codex plugin add codex-usage-stick@codex-usage-stick-marketplace
+codex plugin list
 ```
 
 For local development:
 
 ```bash
-/Applications/Codex.app/Contents/Resources/codex plugin marketplace add /path/to/codex-desktop-buddy
+codex plugin marketplace add /path/to/codex-buddy
 ```
 
 ## Enable Hooks
 
-Enable plugin hooks:
+Check and enable the stable hooks feature if needed:
 
 ```bash
-/Applications/Codex.app/Contents/Resources/codex features enable plugin_hooks
+codex features list
+codex features enable hooks
 ```
 
 If needed, enable the plugin in `~/.codex/config.toml`:
@@ -85,7 +105,7 @@ when Codex shows it.
 ## Dependency
 
 ```bash
-python3 -m pip install bleak
+python -m pip install bleak
 ```
 
 ## Runtime Files
@@ -108,67 +128,81 @@ Default `config.json`:
   "interval": 5.0,
   "scan_timeout": 8.0,
   "restart_delay": 5.0,
+  "reconnect_max_delay": 10.0,
+  "reconnect_reset_after": 30.0,
+  "reconnect_attempts": 720,
+  "notify_timeout": 10.0,
+  "write_timeout": 10.0,
   "verbose": true,
-  "no_approval_proxy": true
+  "no_approval_proxy": true,
+  "no_appserver_usage": true
 }
 ```
 
-Use `address` if macOS BLE name caching makes name scanning unreliable.
+`restart_delay` is the initial reconnect delay. It doubles up to
+`reconnect_max_delay`; a stable session resets the delay. The default
+`reconnect_attempts` permits about two hours of consecutive failures while
+keeping retries bounded. `notify_timeout` and `write_timeout` prevent Windows
+BLE calls from hanging the bridge indefinitely.
+
+Use `address` if BLE name caching makes name scanning unreliable.
 `no_approval_proxy` only disables the older app-server proxy experiment.
 StickS3 approve/deny uses the `PermissionRequest` hook plus the local
-`approval.sock` bridge and works with this value set to `true`.
+authenticated approval endpoint and works with this value set to `true`.
+`no_appserver_usage` keeps usage collection on local Codex rollout files.
 
 ## Commands
 
 Check status:
 
 ```bash
-python3 plugins/codex-usage-stick/scripts/start_bridge.py --status
+python plugins/codex-usage-stick/scripts/start_bridge.py --status
 ```
 
 Start:
 
 ```bash
-python3 plugins/codex-usage-stick/scripts/start_bridge.py
+python plugins/codex-usage-stick/scripts/start_bridge.py
 ```
 
 Stop:
 
 ```bash
-python3 plugins/codex-usage-stick/scripts/start_bridge.py --stop
+python plugins/codex-usage-stick/scripts/start_bridge.py --stop
 ```
 
 Run in foreground:
 
 ```bash
-python3 plugins/codex-usage-stick/scripts/start_bridge.py --foreground
+python plugins/codex-usage-stick/scripts/start_bridge.py --foreground
 ```
 
 Manual hook test:
 
 ```bash
-python3 plugins/codex-usage-stick/scripts/hook_entry.py --event ManualTest
+python plugins/codex-usage-stick/scripts/hook_entry.py --event ManualTest
 ```
 
 ## Verify
 
 Make sure Bluetooth is enabled on the computer.
 
-For the first BLE pairing on a new computer, start with a foreground `busy`
-test so macOS can show the pairing prompt:
+For the first BLE pairing on a new computer, start with a local-only foreground
+`busy` test so the operating system can show the pairing prompt:
 
 ```bash
-python3 ~/.codex/plugins/cache/codex-usage-stick-marketplace/codex-usage-stick/0.4.0/scripts/codex_usage_ble_bridge.py --verbose --state busy
+python plugins/codex-usage-stick/scripts/codex_usage_ble_bridge.py --verbose --state busy --no-appserver-usage
 ```
 
 The StickS3 should show a pairing code. Enter that code on the computer to
 finish the BLE pairing. Once the hardware starts showing usage information,
 stop the foreground test with `Command-C` / `Ctrl-C`.
 
-Then submit a Codex prompt in a project where the plugin hook is trusted:
+Then submit a Codex prompt in a project where the plugin hook is trusted. On
+Windows, inspect the logs with PowerShell:
 
-```bash
-tail -n 20 ~/.codex/codex-usage-bridge/hook.log
+```powershell
+Get-Content -Tail 20 $env:USERPROFILE\.codex\codex-usage-bridge\hook.log
 ```
 
 Expected:
@@ -179,8 +213,8 @@ Expected:
 
 Then check BLE packets:
 
-```bash
-tail -n 40 ~/.codex/codex-usage-bridge/bridge.log
+```powershell
+Get-Content -Tail 40 $env:USERPROFILE\.codex\codex-usage-bridge\bridge.log
 ```
 
 Expected:

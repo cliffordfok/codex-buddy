@@ -25,6 +25,7 @@ START_BRIDGE = PLUGIN_ROOT / "scripts" / "start_bridge.py"
 STATE_DIR = Path.home() / ".codex" / "codex-usage-bridge"
 HOOK_LOG_PATH = STATE_DIR / "hook.log"
 APPROVAL_SOCK_PATH = STATE_DIR / "approval.sock"
+APPROVAL_ENDPOINT_PATH = STATE_DIR / "approval_endpoint.json"
 APPROVAL_WAIT_SEC = 45.0
 APPROVAL_CONNECT_SEC = 4.0
 
@@ -34,10 +35,12 @@ def now_iso() -> str:
 
 
 def read_stdin_text() -> str:
-    """Read hook stdin only when data is already available."""
+    """Read one hook payload without using select() on Windows pipes."""
     try:
         if sys.stdin is None or sys.stdin.closed or sys.stdin.isatty():
             return ""
+        if os.name == "nt":
+            return sys.stdin.read(65536)
         ready, _, _ = select.select([sys.stdin], [], [], 0)
         if not ready:
             return ""
@@ -80,21 +83,63 @@ def permission_output(behavior: str, message: str) -> dict[str, Any]:
     }
 
 
+def normalize_json_strings(value: Any) -> Any:
+    """Recover surrogate-escaped UTF-8 and keep approval JSON encodable."""
+    if isinstance(value, str):
+        try:
+            return value.encode("utf-8", errors="surrogateescape").decode(
+                "utf-8", errors="replace"
+            )
+        except UnicodeEncodeError:
+            return value.encode("utf-8", errors="replace").decode("utf-8")
+    if isinstance(value, dict):
+        return {
+            normalize_json_strings(key): normalize_json_strings(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [normalize_json_strings(item) for item in value]
+    return value
+
+
 def request_hardware_permission(hook_payload: dict[str, Any]) -> dict[str, Any] | None:
     request = {
         "type": "permission_request",
-        "hook": hook_payload,
+        "hook": normalize_json_strings(hook_payload),
         "timeout": APPROVAL_WAIT_SEC,
     }
-    encoded = (json.dumps(request, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
     connect_deadline = time.monotonic() + APPROVAL_CONNECT_SEC
     last_error = ""
+    endpoint_description = str(APPROVAL_ENDPOINT_PATH if os.name == "nt" else APPROVAL_SOCK_PATH)
 
     while True:
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(max(0.2, min(1.0, connect_deadline - time.monotonic())))
-                sock.connect(str(APPROVAL_SOCK_PATH))
+            connect_timeout = max(0.2, min(1.0, connect_deadline - time.monotonic()))
+            authenticated_request = dict(request)
+            if os.name == "nt":
+                endpoint = json.loads(APPROVAL_ENDPOINT_PATH.read_text(encoding="utf-8"))
+                if not isinstance(endpoint, dict) or endpoint.get("version") != 1:
+                    raise ValueError("invalid approval endpoint version")
+                host = endpoint.get("host")
+                port = endpoint.get("port")
+                token = endpoint.get("token")
+                if host != "127.0.0.1":
+                    raise ValueError("approval endpoint must use IPv4 loopback")
+                if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+                    raise ValueError("invalid approval endpoint port")
+                if not isinstance(token, str) or len(token) < 32:
+                    raise ValueError("invalid approval endpoint token")
+                authenticated_request["token"] = token
+                approval_socket = socket.create_connection((host, port), timeout=connect_timeout)
+            else:
+                approval_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                approval_socket.settimeout(connect_timeout)
+                approval_socket.connect(str(APPROVAL_SOCK_PATH))
+
+            encoded = (
+                json.dumps(authenticated_request, separators=(",", ":"), ensure_ascii=False) + "\n"
+            ).encode("utf-8")
+            with approval_socket as sock:
                 sock.sendall(encoded)
                 sock.settimeout(APPROVAL_WAIT_SEC + 2.0)
                 raw = sock.makefile("rb").readline(4096)
@@ -116,15 +161,15 @@ def request_hardware_permission(hook_payload: dict[str, Any]) -> dict[str, Any] 
             if decision == "deny":
                 return permission_output("deny", "Denied from StickS3")
             return None
-        except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError) as exc:
-            last_error = repr(exc)
+        except (FileNotFoundError, ConnectionRefusedError, json.JSONDecodeError, socket.timeout, OSError, ValueError) as exc:
+            last_error = type(exc).__name__
             if time.monotonic() >= connect_deadline:
                 append_log({
                     "time": now_iso(),
                     "event": "PermissionRequest",
                     "phase": "approval_ipc_unavailable",
-                    "socket": str(APPROVAL_SOCK_PATH),
-                    "error": last_error,
+                    "endpoint": endpoint_description,
+                    "error_type": last_error,
                 })
                 return None
             time.sleep(0.2)
@@ -133,7 +178,7 @@ def request_hardware_permission(hook_payload: dict[str, Any]) -> dict[str, Any] 
                 "time": now_iso(),
                 "event": "PermissionRequest",
                 "phase": "approval_ipc_error",
-                "error": repr(exc),
+                "error_type": type(exc).__name__,
             })
             return None
 
@@ -152,7 +197,7 @@ def main() -> int:
         "cwd": os.getcwd(),
         "plugin_root": str(PLUGIN_ROOT),
         "env": env_snapshot(),
-        "stdin_preview": stdin_text[:4096],
+        "stdin_bytes": len(stdin_text.encode("utf-8", errors="replace")),
     })
 
     try:
