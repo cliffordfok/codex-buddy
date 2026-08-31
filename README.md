@@ -66,6 +66,9 @@ When flashing firmware or uploading filesystem data, hold the lower-left side
 button to enter flashing mode. Short-press twice to power off, and short-press
 once to power on.
 
+The firmware's `Sound Off` setting also powers down the StickS3 audio
+codec/amplifier instead of only suppressing UI tones.
+
 ### 2. Install The Codex Plugin
 
 Install Python BLE support:

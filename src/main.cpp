@@ -137,6 +137,16 @@ static void wake() {
 }
 bool     responseSent = false;
 
+static void applySoundHardware() {
+  if (settings().sound) {
+    M5.Speaker.begin();
+  } else {
+    // Sound-off must also disable the StickS3 codec/amplifier. Merely
+    // skipping tone() leaves the audio hardware powered and can allow pops.
+    M5.Speaker.end();
+  }
+}
+
 static void beep(uint16_t freq, uint16_t dur) {
   if (settings().sound) M5.Speaker.tone(freq, dur);
 }
@@ -191,7 +201,10 @@ static void applySetting(uint8_t idx) {
       applyBrightness();
       settingsSave();
       return;
-    case 1: s.sound = !s.sound; break;
+    case 1:
+      s.sound = !s.sound;
+      applySoundHardware();
+      break;
     case 2:
       // BT toggle is a stored preference only — BLE stays live. Turning
       // BLE off cleanly would require tearing down the BLE stack which
@@ -340,7 +353,10 @@ static void drawReset() {
 void menuConfirm() {
   switch (menuSel) {
     case 0: settingsOpen = true; menuOpen = false; settingsSel = 0; break;
-    case 1: M5.Power.powerOff(); break;
+    case 1:
+      M5.Speaker.end();
+      M5.Power.powerOff();
+      break;
     case 2:
     case 3:
       menuOpen = false;
@@ -1474,6 +1490,8 @@ void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
   M5.Lcd.setRotation(0);
+  settingsLoad();
+  applySoundHardware();
   startBt();
   if (LED_PIN >= 0) {
     pinMode(LED_PIN, OUTPUT);
@@ -1481,7 +1499,6 @@ void setup() {
   }
   lastInteractMs = millis();
   statsLoad();
-  settingsLoad();
   brightLevel = settings().brightness;
   applyBrightness();
   petNameLoad();
