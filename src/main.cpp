@@ -1352,6 +1352,9 @@ static void drawUsageDashboardLandscape() {
   static uint8_t cachedPetState = 0xFF;
   static int cachedPetW = 0;
   static int cachedPetH = 0;
+  static int8_t cachedPetMode = -1;
+  static uint8_t cachedBuddySpecies = 0xFF;
+  static uint32_t lastBuddyRenderMs = 0;
   static uint32_t cachedUsageMinute = 0xFFFFFFFF;
   static int cachedBatteryPct = -1;
   static PowerStatus cachedBatteryStatus = PWR_BATTERY;
@@ -1393,26 +1396,30 @@ static void drawUsageDashboardLandscape() {
     cachedUsageMinute = usageMinute;
   }
 
-  if (!buddyMode && characterLoaded()) {
-    bool canvasChanged = false;
-    if (cachedPetW != leftW || cachedPetH != lh) {
-      usagePetSpr.deleteSprite();
-      usagePetSpr.setColorDepth(16);
-      usagePetSpr.createSprite(leftW, lh);
-      cachedPetW = usagePetSpr.width();
-      cachedPetH = usagePetSpr.height();
-      canvasChanged = true;
-    }
+  bool canvasChanged = false;
+  if (cachedPetW != leftW || cachedPetH != lh) {
+    usagePetSpr.deleteSprite();
+    usagePetSpr.setColorDepth(16);
+    usagePetSpr.createSprite(leftW, lh);
+    cachedPetW = usagePetSpr.width();
+    cachedPetH = usagePetSpr.height();
+    canvasChanged = true;
+  }
 
-    bool stateChanged = cachedPetState != activeState;
-    if (canvasChanged || stateChanged) usagePetSpr.fillSprite(p.bg);
+  bool canvasReady = cachedPetW == leftW && cachedPetH == lh;
+  int8_t petMode = buddyMode ? 1 : 0;
+  bool modeChanged = cachedPetMode != petMode;
+  bool stateChanged = cachedPetState != activeState;
+
+  if (!buddyMode && characterLoaded()) {
+    if (canvasChanged || modeChanged || stateChanged) usagePetSpr.fillSprite(p.bg);
 
     characterSetState(activeState);
     bool frameDrawn = false;
-    if (cachedPetW == leftW && cachedPetH == lh) {
+    if (canvasReady) {
       frameDrawn = characterRenderTo(&usagePetSpr, leftW / 2, lh / 2 + 4,
                                      58, 0, 0, leftW, lh);
-      if (repaint || canvasChanged || stateChanged || frameDrawn || batteryChanged) {
+      if (repaint || canvasChanged || modeChanged || stateChanged || frameDrawn || batteryChanged) {
         drawBatteryBadgeOn(&usagePetSpr, 4, 7, p);
         usagePetSpr.pushSprite(0, 0);
       }
@@ -1420,14 +1427,39 @@ static void drawUsageDashboardLandscape() {
       characterRenderTo(&M5.Lcd, leftW / 2, lh / 2 + 4, 58, 0, 0, leftW, lh);
       drawBatteryBadgeOn(&M5.Lcd, 4, 7, p);
     }
-    cachedPetState = activeState;
   } else {
-    cachedPetState = 0xFF;
-    M5.Lcd.fillRect(0, 0, leftW, lh, p.bg);
-    buddySetPeek(true);
-    buddyRenderTo(&M5.Lcd, activeState);
-    drawBatteryBadgeOn(&M5.Lcd, 4, 7, p);
+    // The main loop runs at about 60 fps, while ASCII pets animate at 5 fps.
+    // Drawing directly to the LCD used to expose the clear between every
+    // glyph pass and made the pet flash continuously in landscape. Compose
+    // the complete frame off-screen and only push when something can change.
+    uint32_t now = millis();
+    uint8_t species = buddySpeciesIdx();
+    bool speciesChanged = cachedBuddySpecies != species;
+    bool frameDue = (uint32_t)(now - lastBuddyRenderMs) >= 200;
+    bool redraw = repaint || canvasChanged || modeChanged || stateChanged
+               || speciesChanged || frameDue || batteryChanged;
+    if (redraw) {
+      if (canvasReady) {
+        usagePetSpr.fillSprite(p.bg);
+        buddySetPeek(true);
+        buddyRenderTo(&usagePetSpr, activeState);
+        drawBatteryBadgeOn(&usagePetSpr, 4, 7, p);
+        usagePetSpr.pushSprite(0, 0);
+      } else {
+        // Allocation failure fallback: retain the 5 fps gate so a direct LCD
+        // clear cannot happen on every loop iteration.
+        M5.Lcd.fillRect(0, 0, leftW, lh, p.bg);
+        buddySetPeek(true);
+        buddyRenderTo(&M5.Lcd, activeState);
+        drawBatteryBadgeOn(&M5.Lcd, 4, 7, p);
+      }
+      lastBuddyRenderMs = now;
+    }
+    cachedBuddySpecies = species;
   }
+
+  cachedPetState = activeState;
+  cachedPetMode = petMode;
 
   cachedBatteryPct = _pwrPct;
   cachedBatteryStatus = _pwrStatus;

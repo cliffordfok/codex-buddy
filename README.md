@@ -249,8 +249,8 @@ Tested:
 - Codex usage packets sent from macOS to StickS3.
 - Portrait usage dashboard.
 - Landscape usage dashboard.
-- Landscape GIF rendering through a small canvas to avoid slow direct LCD
-  pixel drawing.
+- Landscape GIF and ASCII pet rendering through a small canvas to avoid
+  visible clearing and slow direct LCD drawing.
 - Local Codex plugin startup on `SessionStart` and `UserPromptSubmit`.
 - Local Codex `PermissionRequest` hook forwarding to StickS3.
 - StickS3 approve/cancel handling for Codex permission prompts.
