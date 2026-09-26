@@ -16,6 +16,10 @@
 
 void bleInit(const char* deviceName);
 bool bleConnected();
+// Drop any current central connection, or refresh advertising when already
+// disconnected. The desktop bridge remains the BLE central and will reconnect
+// on its retry loop.
+void bleReconnect();
 // True once LE Secure Connections bonding has completed for the current
 // link. The NUS characteristics are encrypted-only, so in practice this
 // is always true by the time any data flows; exposed so the status ack

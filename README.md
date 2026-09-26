@@ -359,6 +359,10 @@ tail -n 20 ~/.codex/codex-usage-bridge/hook.log
 tail -n 40 ~/.codex/codex-usage-bridge/bridge.log
 ```
 
+If the StickS3 is not reconnecting, hold A to open the menu, choose
+`reconnect`, then press B. This drops any stale BLE session or restarts
+advertising so the running desktop bridge can connect again.
+
 If Codex shows a hook warning about async hooks, update to this version. The
 plugin hooks in this repo are synchronous and quickly start a background bridge.
 

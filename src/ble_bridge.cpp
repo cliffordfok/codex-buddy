@@ -137,6 +137,30 @@ bool bleConnected() { return connected; }
 bool bleSecure()    { return secure; }
 uint32_t blePasskey() { return passkey; }
 
+void bleReconnect() {
+  if (!server) {
+    Serial.println("[ble] manual reconnect skipped: server unavailable");
+    return;
+  }
+
+  secure = false;
+  passkey = 0;
+  mtu = 23;
+
+  if (connected) {
+    Serial.println("[ble] manual reconnect: disconnecting current client");
+    server->disconnect(server->getConnId());
+    return;
+  }
+
+  // A peripheral cannot initiate a connection. Refresh its advertisement so
+  // the desktop bridge can discover it again on the next retry.
+  BLEDevice::stopAdvertising();
+  delay(50);
+  BLEDevice::startAdvertising();
+  Serial.println("[ble] manual reconnect: advertising restarted");
+}
+
 void bleClearBonds() {
   int n = esp_ble_get_bond_device_num();
   if (n <= 0) return;
