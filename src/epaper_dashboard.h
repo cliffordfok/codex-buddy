@@ -5,6 +5,8 @@
 struct EpaperDashboardState {
   bool live;
   bool usageAvailable;
+  bool batteryAvailable;
+  uint8_t batteryPct;
   uint8_t primaryUsed;
   uint8_t secondaryUsed;
   uint8_t personaState;

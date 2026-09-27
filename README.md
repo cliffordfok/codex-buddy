@@ -62,11 +62,12 @@ are powered off:
 | `GND` | `GND` |
 | `VCC` | `3V3_L2` |
 
-The built-in LCD keeps its normal animation. The e-paper shows a static pet
-and quota dashboard, refreshes only when its displayed data changes, waits at
-least 30 seconds between refreshes, and periodically uses a full refresh to
-limit ghosting. It pauses e-paper refresh while a permission prompt or menu is
-open so the several-second panel waveform cannot interfere with button input.
+The built-in LCD keeps its normal animation. The e-paper shows a static pet,
+smoothed battery level, and quota dashboard. It refreshes only when its
+displayed data changes, waits at least 30 seconds between refreshes, and
+periodically uses a full refresh to limit ghosting. It pauses e-paper refresh
+while a permission prompt or menu is open so the several-second panel waveform
+cannot interfere with button input.
 
 ## Quick Start
 

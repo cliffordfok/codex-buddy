@@ -70,6 +70,8 @@ uint32_t signatureFor(const EpaperDashboardState& s) {
   uint32_t hash = 2166136261UL;
   hash = hashByte(hash, s.live ? 1 : 0);
   hash = hashByte(hash, s.usageAvailable ? 1 : 0);
+  hash = hashByte(hash, s.batteryAvailable ? 1 : 0);
+  hash = hashByte(hash, s.batteryPct);
   hash = hashByte(hash, s.primaryUsed);
   hash = hashByte(hash, s.secondaryUsed);
   hash = hashByte(hash, s.personaState);
@@ -176,6 +178,27 @@ void drawUsageMeter(int y, const char* label, uint8_t usedPct,
   epaper.print(reset);
 }
 
+void drawBattery(const EpaperDashboardState& s) {
+  constexpr int x = 272;
+  constexpr int y = 12;
+  constexpr int innerW = 16;
+
+  epaper.drawRect(x, y, 20, 10, GxEPD_BLACK);
+  epaper.fillRect(x + 20, y + 3, 3, 4, GxEPD_BLACK);
+  if (s.batteryAvailable && s.batteryPct > 0) {
+    int fillW = (int)((uint32_t)innerW * s.batteryPct / 100);
+    if (fillW > 0) epaper.fillRect(x + 2, y + 2, fillW, 6, GxEPD_BLACK);
+  }
+
+  epaper.setTextSize(1);
+  epaper.setCursor(300, 16);
+  if (s.batteryAvailable) {
+    epaper.printf("%u%%", s.batteryPct);
+  } else {
+    epaper.print("--%");
+  }
+}
+
 void drawDashboard(const EpaperDashboardState& s) {
   epaper.fillScreen(GxEPD_WHITE);
   epaper.setTextColor(GxEPD_BLACK);
@@ -185,6 +208,7 @@ void drawDashboard(const EpaperDashboardState& s) {
   epaper.setCursor(8, 10);
   epaper.print("CODEX USAGE");
   epaper.setTextSize(1);
+  drawBattery(s);
   epaper.setCursor(344, 16);
   epaper.print(s.live ? "[ LIVE ]" : "[ WAIT ]");
   epaper.drawFastHLine(8, 38, 384, GxEPD_BLACK);

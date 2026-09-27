@@ -482,25 +482,75 @@ static void clockRefreshRtc() {
 }
 
 enum PowerStatus { PWR_BATTERY, PWR_USB, PWR_CHARGING, PWR_FULL };
+static constexpr int PWR_PCT_FILTER_SCALE = 8;
+static constexpr int PWR_PCT_HYSTERESIS = 2;
+static constexpr uint32_t PWR_PCT_MIN_CHANGE_MS = 10000;
 static uint32_t _pwrLastRead = 0;
 static int      _pwrBat_mV = 0;
 static int      _pwrBat_mA = 0;
 static int      _pwrPct = 0;
+static int      _pwrPctFilterX8 = -1;
+static uint32_t _pwrPctLastChange = 0;
 static bool     _pwrUsb = false;
 static bool     _pwrCharging = false;
 static PowerStatus _pwrStatus = PWR_BATTERY;
 static uint8_t  _pwrFullStable = 0;
+
+static void powerUpdatePercentage(int rawPct) {
+  // M5Unified derives StickS3 percentage directly from battery voltage, where
+  // a few millivolts can move the result by 1%. Smooth that conversion and add
+  // hysteresis so radio/display load ripple cannot make the badge count up and
+  // down every second.
+  if (rawPct < 0) return;
+  if (rawPct > 100) rawPct = 100;
+
+  if (_pwrPctFilterX8 < 0) {
+    _pwrPct = rawPct;
+    _pwrPctFilterX8 = rawPct * PWR_PCT_FILTER_SCALE;
+    _pwrPctLastChange = millis();
+    return;
+  }
+
+  _pwrPctFilterX8 = (_pwrPctFilterX8 * (PWR_PCT_FILTER_SCALE - 1)
+                    + rawPct * PWR_PCT_FILTER_SCALE
+                    + PWR_PCT_FILTER_SCALE / 2) / PWR_PCT_FILTER_SCALE;
+  int filteredPct = (_pwrPctFilterX8 + PWR_PCT_FILTER_SCALE / 2)
+                  / PWR_PCT_FILTER_SCALE;
+
+  if ((uint32_t)(millis() - _pwrPctLastChange) < PWR_PCT_MIN_CHANGE_MS) return;
+
+  bool shouldChange;
+  if (M5.getBoard() == m5::board_t::board_M5StickS3) {
+    // A voltage-only gauge should move monotonically for a fixed power source:
+    // discharge can only reduce it, while USB power can only increase it.
+    shouldChange = _pwrUsb
+        ? (filteredPct == 100 && _pwrPct < 100)
+          || filteredPct >= _pwrPct + PWR_PCT_HYSTERESIS
+        : (filteredPct == 0 && _pwrPct > 0)
+          || filteredPct <= _pwrPct - PWR_PCT_HYSTERESIS;
+  } else {
+    // Preserve support for boards whose USB detection is only a voltage proxy.
+    shouldChange = (filteredPct == 100 && _pwrPct < 100)
+                || (filteredPct == 0 && _pwrPct > 0)
+                || filteredPct >= _pwrPct + PWR_PCT_HYSTERESIS
+                || filteredPct <= _pwrPct - PWR_PCT_HYSTERESIS;
+  }
+
+  if (shouldChange) {
+    _pwrPct = filteredPct;
+    _pwrPctLastChange = millis();
+  }
+}
+
 static void powerRefresh() {
   if (_pwrLastRead != 0 && millis() - _pwrLastRead < 1000) return;
   _pwrLastRead = millis();
 
   _pwrBat_mV = M5.Power.getBatteryVoltage();
   _pwrBat_mA = M5.Power.getBatteryCurrent();
-  _pwrPct = M5.Power.getBatteryLevel();
-  if (_pwrPct < 0) _pwrPct = 0;
-  if (_pwrPct > 100) _pwrPct = 100;
   _pwrUsb = usbPresent();
   _pwrCharging = M5.Power.isCharging();
+  powerUpdatePercentage(M5.Power.getBatteryLevel());
 
   if (!_pwrUsb) {
     _pwrStatus = PWR_BATTERY;
@@ -1884,11 +1934,14 @@ void loop() {
     usageFullPushNeeded = !usagePlain;
   }
 
+  powerRefresh();
   uint32_t epaperUtcNow = 0;
   bool epaperHasUtc = dataUtcNow(&epaperUtcNow);
   EpaperDashboardState epaperState = {
     tama.connected,
     tama.codexPrimaryResetsAt > 0 || tama.codexSecondaryResetsAt > 0,
+    _pwrPctFilterX8 >= 0,
+    (uint8_t)_pwrPct,
     tama.codexPrimary,
     tama.codexSecondary,
     (uint8_t)activeState,
