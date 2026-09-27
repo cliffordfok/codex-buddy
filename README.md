@@ -47,6 +47,27 @@ Tested target:
 M5Stack StickS3 / ESP32-S3
 ```
 
+Optional external display: Waveshare 4.2-inch e-Paper Module Rev2.2,
+400x300 black/white. Connect it to the StickS3 Hat2-Bus while both devices
+are powered off:
+
+| e-Paper | StickS3 |
+| --- | --- |
+| `BUSY` | `G4` |
+| `RST` | `G7` |
+| `DC` | `G1` |
+| `CS` | `G8` |
+| `CLK` | `G5` |
+| `DIN` | `G6` |
+| `GND` | `GND` |
+| `VCC` | `3V3_L2` |
+
+The built-in LCD keeps its normal animation. The e-paper shows a static pet
+and quota dashboard, refreshes only when its displayed data changes, waits at
+least 30 seconds between refreshes, and periodically uses a full refresh to
+limit ghosting. It pauses e-paper refresh while a permission prompt or menu is
+open so the several-second panel waveform cannot interfere with button input.
+
 ## Quick Start
 
 For a full walkthrough, use [docs/USAGE.md](docs/USAGE.md).

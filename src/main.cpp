@@ -5,6 +5,7 @@
 static void appRtcSynced(time_t localEpoch);
 #include "data.h"
 #include "buddy.h"
+#include "epaper_dashboard.h"
 
 M5Canvas spr(&M5.Lcd);
 M5Canvas usagePetSpr(&M5.Lcd);
@@ -1569,6 +1570,7 @@ void setup() {
   }
 
   Serial.println("codex usage monitor ready");
+  epaperDashboardBegin();
 }
 
 void loop() {
@@ -1881,6 +1883,29 @@ void loop() {
     }
     usageFullPushNeeded = !usagePlain;
   }
+
+  uint32_t epaperUtcNow = 0;
+  bool epaperHasUtc = dataUtcNow(&epaperUtcNow);
+  EpaperDashboardState epaperState = {
+    tama.connected,
+    tama.codexPrimaryResetsAt > 0 || tama.codexSecondaryResetsAt > 0,
+    tama.codexPrimary,
+    tama.codexSecondary,
+    (uint8_t)activeState,
+    tama.codexPrimaryResetsAt,
+    tama.codexSecondaryResetsAt,
+    epaperHasUtc ? epaperUtcNow : 0,
+    tama.codexTokens,
+    stateNames[activeState],
+  };
+  bool epaperRefreshAllowed = !inPrompt
+                          && !menuOpen
+                          && !settingsOpen
+                          && !resetOpen
+                          && !xferActive()
+                          && !M5.BtnA.isPressed()
+                          && !M5.BtnB.isPressed();
+  epaperDashboardPoll(epaperState, epaperRefreshAllowed);
 
   // Face-down nap: dim immediately, pause animations, accumulate sleep time.
   // Skipped during approval — you're holding it to read, not sleeping it.
